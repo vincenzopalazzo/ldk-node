@@ -38,9 +38,12 @@ jobs:
       - name: Install Rust ${{ matrix.toolchain }} toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile=minimal --default-toolchain ${{ matrix.toolchain }}
-      - name: Check formatting on Rust ${{ matrix.toolchain }}
+      - name: Install Rust nightly rustfmt
         if: matrix.check-fmt
-        run: rustup component add rustfmt && cargo fmt --all -- --check
+        run: rustup toolchain install nightly --component rustfmt --profile minimal
+      - name: Check formatting using nightly rustfmt
+        if: matrix.check-fmt
+        run: cargo +nightly fmt --all -- --check
       - name: Set RUSTFLAGS to deny warnings
         if: "matrix.toolchain == 'stable'"
         run: echo "RUSTFLAGS=-D warnings" >> "$GITHUB_ENV"
