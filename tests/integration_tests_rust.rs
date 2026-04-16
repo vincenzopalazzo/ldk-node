@@ -2879,3 +2879,317 @@ async fn splice_in_with_all_balance() {
 	node_a.stop().unwrap();
 	node_b.stop().unwrap();
 }
+
+/// Test that multiple BOLT 12 payments can be sent in parallel over a single channel.
+///
+/// This validates the holding cell batching mechanism in rust-lightning: when multiple
+/// HTLCs are dispatched while a commitment round-trip is already in-flight, they are
+/// queued in the holding cell and batch-flushed into a single `commitment_signed` when
+/// the `revoke_and_ack` arrives.
+///
+/// The test sends `NUM_PAYMENTS` payments from node_a to node_b through a single channel,
+/// each paying a separate BOLT 12 offer. All `send()` calls are made sequentially in a
+/// tight loop (which is sufficient — see design doc), and then the event loop collects
+/// all `PaymentSuccessful` / `PaymentFailed` events.
+///
+/// Protocol-level flow for N parallel payments on one channel:
+///
+/// ```text
+///   node_a                                    node_b
+///     │                                         │
+///     │── invoice_request #1 (onion msg) ──────►│
+///     │── invoice_request #2 (onion msg) ──────►│
+///     │── ...                                   │
+///     │── invoice_request #N (onion msg) ──────►│
+///     │                                         │
+///     │◄── Bolt12Invoice #1 (onion msg) ───────┤
+///     │  → HTLC #1 added, commitment_signed    │
+///     │  → channel: AWAITING_REMOTE_REVOKE      │
+///     │                                         │
+///     │◄── Bolt12Invoice #2..#M ───────────────┤
+///     │  → HTLCs #2..#M queued in holding cell  │
+///     │                                         │
+///     │◄── revoke_and_ack ─────────────────────┤
+///     │  → holding cell drained                 │
+///     │  → commitment_signed (batch of #2..#M)  │
+///     │                                         │
+///     │  ... repeat until all N HTLCs in-flight  │
+///     │                                         │
+///     │  PaymentSuccessful × N                  │
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn parallel_bolt12_payments_single_channel() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = random_chain_source(&bitcoind, &electrsd);
+	let (node_a, node_b) = setup_two_nodes(&chain_source, false, true, false);
+
+	// Fund node_a and open a channel to node_b.
+	//
+	// We use a 4M sat channel which gives ~4,000,000,000 msat outbound capacity.
+	// Each payment is 1,000,000 msat (1,000 sats), so 5 payments = 5,000,000 msat
+	// which is well within capacity and the 483 HTLC-per-direction limit.
+	let address_a = node_a.onchain_payment().new_address().unwrap();
+	let premine_amount_sat = 5_000_000;
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![address_a],
+		Amount::from_sat(premine_amount_sat),
+	)
+	.await;
+
+	node_a.sync_wallets().unwrap();
+	open_channel(&node_a, &node_b, 4_000_000, true, &electrsd).await;
+
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+
+	expect_channel_ready_event!(node_a, node_b.node_id());
+	expect_channel_ready_event!(node_b, node_a.node_id());
+
+	// Wait for node_b to broadcast its node announcement so that node_a can
+	// find blinded message paths for the invoice_request onion messages.
+	while node_b.status().latest_node_announcement_broadcast_timestamp.is_none() {
+		tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+	}
+	tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+	// ── Create offers and send payments ─────────────────────────────────
+	//
+	// We create a separate offer for each payment. Each offer is for a fixed
+	// amount (1,000 sats = 1,000,000 msat). BOLT 12 offers are reusable, but
+	// here we use separate offers to get distinct payment flows and make
+	// tracking clearer.
+	//
+	// NOTE: We use 5 payments instead of 100 to keep the test fast. The
+	// mechanism is identical — the holding cell batches however many HTLCs
+	// arrive while a commitment round-trip is in-flight.
+	const NUM_PAYMENTS: usize = 5;
+	let payment_amount_msat = 1_000_000;
+
+	let mut payment_ids = Vec::with_capacity(NUM_PAYMENTS);
+
+	for i in 0..NUM_PAYMENTS {
+		// Each offer is created by node_b (the payee).
+		let offer = node_b
+			.bolt12_payment()
+			.receive(payment_amount_msat, &format!("parallel-test-{}", i), None, None)
+			.unwrap();
+
+		// node_a sends the payment. This call:
+		//   1. Generates a random PaymentId
+		//   2. Sends an invoice_request onion message to node_b
+		//   3. Returns Ok(PaymentId) immediately — no HTLC sent yet
+		let payer_note = Some(format!("payment-{}", i));
+		let payment_id =
+			node_a.bolt12_payment().send(&offer, None, payer_note, None).unwrap();
+		payment_ids.push(payment_id);
+	}
+
+	assert_eq!(payment_ids.len(), NUM_PAYMENTS);
+
+	// ── Collect PaymentSuccessful events on node_a ──────────────────────
+	//
+	// Each payment will eventually produce either PaymentSuccessful or
+	// PaymentFailed. We collect all of them.
+	let mut succeeded_ids: HashSet<PaymentId> = HashSet::new();
+	let mut pending: HashSet<PaymentId> = payment_ids.iter().cloned().collect();
+
+	while !pending.is_empty() {
+		let event = node_a.next_event_async().await;
+		match event {
+			Event::PaymentSuccessful { payment_id: Some(id), .. } if pending.contains(&id) => {
+				pending.remove(&id);
+				succeeded_ids.insert(id);
+			},
+			Event::PaymentFailed { payment_id: Some(id), reason, .. }
+				if pending.contains(&id) =>
+			{
+				panic!(
+					"Payment {:?} failed unexpectedly: {:?}. \
+					 This indicates a bug — all {} payments should succeed \
+					 given sufficient channel capacity.",
+					id, reason, NUM_PAYMENTS
+				);
+			},
+			_ => {},
+		}
+		node_a.event_handled().unwrap();
+	}
+
+	assert_eq!(
+		succeeded_ids.len(),
+		NUM_PAYMENTS,
+		"Expected all {} payments to succeed, but only {} did",
+		NUM_PAYMENTS,
+		succeeded_ids.len()
+	);
+
+	// ── Collect PaymentReceived events on node_b ────────────────────────
+	//
+	// node_b should have received NUM_PAYMENTS payments.
+	for _ in 0..NUM_PAYMENTS {
+		expect_payment_received_event!(node_b, payment_amount_msat);
+	}
+
+	// ── Verify payment store on sender (node_a) ─────────────────────────
+	//
+	// All payments should be recorded as Bolt12Offer with status Succeeded.
+	let node_a_payments = node_a
+		.list_payments_with_filter(|p| matches!(p.kind, PaymentKind::Bolt12Offer { .. }));
+	assert_eq!(
+		node_a_payments.len(),
+		NUM_PAYMENTS,
+		"node_a should have {} Bolt12Offer payments recorded, found {}",
+		NUM_PAYMENTS,
+		node_a_payments.len()
+	);
+
+	for payment in &node_a_payments {
+		assert_eq!(payment.status, PaymentStatus::Succeeded);
+		assert_eq!(payment.amount_msat, Some(payment_amount_msat));
+		assert_eq!(payment.direction, PaymentDirection::Outbound);
+
+		match &payment.kind {
+			PaymentKind::Bolt12Offer { hash, preimage, .. } => {
+				assert!(hash.is_some(), "Completed BOLT12 payment should have a hash");
+				assert!(preimage.is_some(), "Completed BOLT12 payment should have a preimage");
+			},
+			other => panic!("Expected Bolt12Offer payment kind, got {:?}", other),
+		}
+	}
+
+	// ── Verify payment store on receiver (node_b) ───────────────────────
+	let node_b_payments = node_b
+		.list_payments_with_filter(|p| matches!(p.kind, PaymentKind::Bolt12Offer { .. }));
+	assert_eq!(
+		node_b_payments.len(),
+		NUM_PAYMENTS,
+		"node_b should have {} Bolt12Offer payments recorded, found {}",
+		NUM_PAYMENTS,
+		node_b_payments.len()
+	);
+
+	for payment in &node_b_payments {
+		assert_eq!(payment.status, PaymentStatus::Succeeded);
+		assert_eq!(payment.amount_msat, Some(payment_amount_msat));
+		assert_eq!(payment.direction, PaymentDirection::Inbound);
+	}
+
+	// ── Sanity check: no sats were lost ─────────────────────────────────
+	//
+	// The total balance across both nodes (on-chain + lightning) should be
+	// conserved. The only "leakage" is mining fees paid during channel open,
+	// which come from node_a's on-chain wallet (not from the channel).
+	//
+	// For the lightning side specifically:
+	//   - node_a started with the full channel capacity
+	//   - node_a sent NUM_PAYMENTS × payment_amount_msat to node_b
+	//   - node_b received exactly that amount
+	//   - No routing fees because it's a direct single-hop channel
+	//
+	// So: node_a_lightning + node_b_lightning == channel_capacity (in sats)
+	let balances_a = node_a.list_balances();
+	let balances_b = node_b.list_balances();
+
+	let total_sent_sats = (NUM_PAYMENTS as u64 * payment_amount_msat) / 1000;
+
+	// node_b should have received exactly the total sent amount in lightning balance
+	assert_eq!(
+		balances_b.total_lightning_balance_sats, total_sent_sats,
+		"node_b lightning balance ({}) should equal total sent ({} sats = {} payments × {} msat)",
+		balances_b.total_lightning_balance_sats,
+		total_sent_sats,
+		NUM_PAYMENTS,
+		payment_amount_msat,
+	);
+
+	// The sum of both nodes' lightning balances should equal the channel value.
+	// This confirms no sats were lost or created during the payment flow.
+	let channels = node_a.list_channels();
+	assert_eq!(channels.len(), 1, "Channel should still be open after parallel payments");
+	let channel_value_sats = channels[0].channel_value_sats;
+
+	// The total lightning balance is less than channel capacity because the commitment
+	// transaction fee is deducted from the opener's (node_a's) balance. We compute
+	// it exactly using the known commitment tx base weights from rust-lightning:
+	//
+	//   commit_tx_fee = feerate_per_kw * base_weight / 1000
+	//
+	// After all HTLCs settle, there are 0 pending HTLCs in the commitment tx, so we
+	// only pay for the base weight. The base weight depends on the channel type:
+	//
+	//   - Non-anchor channels:                       724 WU
+	//   - Anchor channels (zero-fee HTLC):          1124 WU
+	//   - Anchor zero-fee-commitment channels:          0 (fee is zero)
+	//
+	// See rust-lightning: lightning/src/ln/chan_utils.rs::commitment_tx_base_weight()
+	//
+	// Rather than guessing the channel type, we verify the balance invariant:
+	//
+	//   node_a_lightning + node_b_lightning + commit_fee == channel_capacity
+	//
+	// We know node_b received exactly total_sent_sats, so:
+	//
+	//   commit_fee = channel_capacity - node_a_lightning - node_b_lightning
+	//
+	// And we verify that this fee is consistent with one of the known base weights.
+	let feerate_per_kw = channels[0].feerate_sat_per_1000_weight as u64;
+
+	let total_lightning_sats =
+		balances_a.total_lightning_balance_sats + balances_b.total_lightning_balance_sats;
+
+	let actual_commit_fee_sat = channel_value_sats - total_lightning_sats;
+
+	// Compute the expected fee for each known channel type
+	let fee_non_anchor = feerate_per_kw * 724 / 1000;
+	let fee_anchor = feerate_per_kw * 1124 / 1000;
+	let fee_zero_fee_commitment: u64 = 0;
+
+	assert!(
+		actual_commit_fee_sat == fee_non_anchor
+			|| actual_commit_fee_sat == fee_anchor
+			|| actual_commit_fee_sat == fee_zero_fee_commitment,
+		"Commitment fee {} sats doesn't match any known channel type at {} sat/kw: \
+		 non-anchor={}, anchor={}, zero-fee-commitment={}. \
+		 Balances: node_a={}, node_b={}, channel_capacity={}. Sats may have been lost!",
+		actual_commit_fee_sat,
+		feerate_per_kw,
+		fee_non_anchor,
+		fee_anchor,
+		fee_zero_fee_commitment,
+		balances_a.total_lightning_balance_sats,
+		balances_b.total_lightning_balance_sats,
+		channel_value_sats,
+	);
+
+	// Double-check: node_a should have lost exactly (payments + commit_fee) from capacity
+	assert_eq!(
+		balances_a.total_lightning_balance_sats,
+		channel_value_sats - total_sent_sats - actual_commit_fee_sat,
+		"node_a balance ({}) should equal channel_capacity ({}) - sent ({}) - commit_fee ({})",
+		balances_a.total_lightning_balance_sats,
+		channel_value_sats,
+		total_sent_sats,
+		actual_commit_fee_sat,
+	);
+
+	// Verify no fees were charged (direct channel, no intermediaries)
+	let node_a_payments = node_a
+		.list_payments_with_filter(|p| matches!(p.kind, PaymentKind::Bolt12Offer { .. }));
+	for payment in &node_a_payments {
+		assert_eq!(
+			payment.fee_paid_msat,
+			Some(0),
+			"Direct single-hop payments should have zero routing fees, \
+			 but payment {:?} paid {:?} msat in fees",
+			payment.id,
+			payment.fee_paid_msat,
+		);
+	}
+
+	node_a.stop().unwrap();
+	node_b.stop().unwrap();
+}
