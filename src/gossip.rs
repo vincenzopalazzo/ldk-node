@@ -7,6 +7,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use lightning_block_sync::gossip::GossipVerifier;
 
@@ -88,8 +89,36 @@ impl GossipSource {
 								);
 								Error::GossipUpdateFailed
 							})?;
-						latest_sync_timestamp.store(new_latest_sync_timestamp, Ordering::Release);
-						Ok(new_latest_sync_timestamp)
+						// update_network_graph returns the snapshot's internal
+						// latest_seen_timestamp (the newest gossip-message ts inside the
+						// snapshot). Two problems with persisting that verbatim:
+						//
+						//   1. The reference RGS server only serves snapshots at multiples of
+						//      SYMLINK_GRANULARITY_INTERVAL (3h). A raw gossip-message ts is
+						//      almost never aligned, so re-requesting it 404s.
+						//
+						//   2. Even an aligned ts can be newer than the server's latest
+						//      regenerated reference_timestamp (the server's snapshot_interval
+						//      can be longer than its symlink granularity in production), so
+						//      the symlink for that aligned boundary may not exist yet.
+						//
+						// Fix: align down to the 3h grid AND cap at `now − SAFE_LAG_SECS` so
+						// we never query forward of the server's most recent regen window.
+						// Never regress past query_timestamp (the value we just succeeded
+						// with) — that boundary is demonstrably served.
+						const RGS_SNAPSHOT_GRANULARITY_SECS: u32 = 10800;
+						const SAFE_LAG_SECS: u32 = 6 * 3600;
+						let now = SystemTime::now()
+							.duration_since(UNIX_EPOCH)
+							.map(|d| d.as_secs() as u32)
+							.unwrap_or(new_latest_sync_timestamp);
+						let safe_max = now.saturating_sub(SAFE_LAG_SECS);
+						let capped = std::cmp::min(new_latest_sync_timestamp, safe_max);
+						let aligned = capped - (capped % RGS_SNAPSHOT_GRANULARITY_SECS);
+						let next_sync_timestamp = std::cmp::max(aligned, query_timestamp);
+						latest_sync_timestamp
+							.store(next_sync_timestamp, Ordering::Release);
+						Ok(next_sync_timestamp)
 					},
 					code => {
 						log_trace!(logger, "Failed to retrieve RGS gossip update: HTTP {}", code);
