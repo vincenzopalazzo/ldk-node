@@ -229,6 +229,7 @@ enum NodeError {
 	"LnurlAuthFailed",
 	"LnurlAuthTimeout",
 	"InvalidLnurl",
+	"ChannelMonitorNotFound",
 };
 
 typedef dictionary NodeStatus;
