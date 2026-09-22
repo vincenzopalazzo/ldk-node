@@ -51,10 +51,8 @@ where
 		let _guard = self.mutation_lock.lock().await;
 		let data = {
 			let mut locked_peers = self.peers.write().expect("lock");
-			if let Some(existing) = locked_peers.get(&peer_info.node_id) {
-				if existing.address == peer_info.address {
-					return Ok(());
-				}
+			if locked_peers.get(&peer_info.node_id) == Some(&peer_info) {
+				return Ok(());
 			}
 
 			// Temporarily apply the update so it is included in the
